@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2013-2015  Nick Dajda <nick.dajda@gmail.com>
+# Copyright (c) 2013-2016  Nick Dajda <nick.dajda@gmail.com>
 #
 # Distributed under the terms of the GNU GENERAL PUBLIC LICENSE
 #
@@ -119,15 +119,19 @@ class MyXSearch(SearchList):
         name. If not given, then a default binding will be used.
         """
 
-        # If this generator has been called in the [SummaryByMonth] or [SummaryByYear]
-        # section in skin.conf then valid_timespan won't contain enough history data for
-        # the colourful summary tables.
-        alltime_timespan = weeutil.weeutil.TimeSpan(db_lookup().first_timestamp, db_lookup().last_timestamp)
-
-
         # Time to recalculate?
         if (time.time() - (self.refresh_interval * 60)) > self.cache_time:
             self.cache_time = time.time()
+
+            #
+            # The all time statistics
+            #
+
+            # If this generator has been called in the [SummaryByMonth] or [SummaryByYear]
+            # section in skin.conf then valid_timespan won't contain enough history data for
+            # the colourful summary tables.
+            alltime_timespan = weeutil.weeutil.TimeSpan(db_lookup().first_timestamp, db_lookup().last_timestamp)
+
 
             # First, get a TimeSpanStats object for all time. This one is easy
             # because the object valid_timespan already holds all valid times to be
@@ -148,7 +152,19 @@ class MyXSearch(SearchList):
                 noaa = True if table == 'NOAA' else False
 
                 table_options = weeutil.weeutil.accumulateLeaves(self.table_dict[table])
-                self.search_list_extension[table + '_table'] = self._statsHTMLTable(table_options, all_stats, NOAA=noaa)
+
+                # Show all time unless starting date specified
+                startdate = table_options.get('startdate', None)
+                if startdate is not None:
+                    table_timespan = weeutil.weeutil.TimeSpan(int(startdate), db_lookup().last_timestamp)
+                    table_stats = TimespanBinder(table_timespan, db_lookup, formatter=self.generator.formatter,
+                                      converter=self.generator.converter)
+                else:
+                    table_stats = all_stats
+
+                table_name = table + '_table'
+                self.search_list_extension[table_name] = self._statsHTMLTable(table_options, table_stats, table_name,
+                                                                              NOAA=noaa)
                 ngen += 1
 
             t2 = time.time()
@@ -158,7 +174,7 @@ class MyXSearch(SearchList):
 
         return [self.search_list_extension]
 
-    def _statsHTMLTable(self, table_options, all_stats, NOAA=False):
+    def _statsHTMLTable(self, table_options, table_stats, table_name, NOAA=False):
         """
         table_options: Dictionary containing skin.conf options for particluar table
         all_stats: Link to all_stats TimespanBinder
@@ -171,19 +187,58 @@ class MyXSearch(SearchList):
         else:
             obs_type = table_options['obs_type']
             aggregate_type = table_options['aggregate_type']
-            converter = all_stats.converter
+            converter = table_stats.converter
 
             # obs_type
-            reading = getattr(getattr(all_stats, obs_type), aggregate_type)
+            readingBinder = getattr(table_stats, obs_type)
+
+            # Some aggregate come with an argument
+            if aggregate_type in ['max_ge', 'max_le', 'min_le', 'sum_ge']:
+
+                try:
+                    threshold_value = float(table_options['aggregate_threshold'][0])
+                except KeyError:
+                    syslog.syslog(syslog.LOG_INFO, "%s: Problem with aggregate_threshold. Should be in the format: [value], [units]" %
+                                  (os.path.basename(__file__)))
+                    return "Could not generate table %s" % table_name
+
+                threshold_units = table_options['aggregate_threshold'][1]
+
+                try:
+                    reading = getattr(readingBinder, aggregate_type)((threshold_value, threshold_units))
+                except IndexError:
+                    syslog.syslog(syslog.LOG_INFO, "%s: Problem with aggregate_threshold units: %s" % (os.path.basename(__file__),
+                                                                                                       str(threshold_units)))
+                    return "Could not generate table %s" % table_name
+            else:
+                try:
+                    reading = getattr(readingBinder, aggregate_type)
+                except KeyError:
+                    syslog.syslog(syslog.LOG_INFO, "%s: aggregate_type %s not found" % (os.path.basename(__file__),
+                                                                                        aggregate_type))
+                    return "Could not generate table %s" % table_name
+
             unit_type = reading.converter.group_unit_dict[reading.value_t[2]]
 
-            try:
-                unit_formatted = reading.formatter.unit_label_dict[unit_type]
-            except:
-                unit_formatted = ""
+            unit_formatted = ''
+
+            # 'units' option in skin.conf?
+            if 'units' in table_options:
+                unit_formatted = table_options['units']
+            else:
+                if (unit_type == 'count'):
+                    unit_formatted = "Days"
+                else:
+                    if unit_type in reading.formatter.unit_label_dict:
+                        unit_formatted = reading.formatter.unit_label_dict[unit_type]
+
+            # For aggregrate types which return number of occurrences (e.g. max_ge), set format to integer
 
             # Don't catch error here - we absolutely need the string format
-            format_string = reading.formatter.unit_format_dict[unit_type]
+            if unit_type == 'count':
+                format_string = '%d'
+            else:
+                format_string = reading.formatter.unit_format_dict[unit_type]
 
         htmlText = '<table class="table">'
         htmlText += "    <thead>"
@@ -197,7 +252,7 @@ class MyXSearch(SearchList):
         htmlText += "    </thead>"
         htmlText += "    <tbody>"
 
-        for year in all_stats.years():
+        for year in table_stats.years():
             year_number = datetime.fromtimestamp(year.timespan[0]).year
 
             htmlLine = (' ' * 8) + "<tr>\n"
@@ -213,13 +268,20 @@ class MyXSearch(SearchList):
                     #for property, value in vars(month.dateTime.value_t[0]).iteritems():
                     #    print property, ": ", value
 
-                    if (month.timespan[1] < all_stats.timespan.start) or (month.timespan[0] > all_stats.timespan.stop):
+                    if (month.timespan[1] < table_stats.timespan.start) or (month.timespan[0] > table_stats.timespan.stop):
                         # print "No data for... %d, %d" % (year_number, datetime.fromtimestamp(month.timespan[0]).month)
                         htmlLine += "<td>-</td>\n"
                     else:
                         htmlLine += self._NoaaCell(datetime.fromtimestamp(month.timespan[0]), table_options)
                 else:
-                    value = converter.convert(getattr(getattr(month, obs_type), aggregate_type).value_t)
+                    if unit_type == 'count':
+                        try:
+                            value = getattr(getattr(month, obs_type), aggregate_type)((threshold_value, threshold_units)).value_t
+                        except:
+                            value = [0, 'count']
+                    else:
+                        value = converter.convert(getattr(getattr(month, obs_type), aggregate_type).value_t)
+
                     htmlLine += (' ' * 12) + self._colorCell(value[0], format_string, bgColours)
 
             htmlLine += (' ' * 8) + "</tr>\n"
